@@ -20,7 +20,8 @@ import sounddevice as sd
 import soundfile as sf
 from scipy.signal import resample_poly
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QRectF, QSettings, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSlider,
     QStackedWidget,
     QTextEdit,
     QVBoxLayout,
@@ -53,6 +55,14 @@ FILE_SEGMENT_SECONDS = 20  # long files are transcribed in pieces of this length
 
 ENGINE_NAMES = {"onnx": "ONNX", "nemo": "NeMo"}
 ENGINE_KEYS = list(ENGINE_NAMES)
+
+# Mic sensitivity (noise gate). The slider runs 0..100; higher = picks up quieter sounds.
+DEFAULT_SENSITIVITY = 60
+GATE_LOUDEST_DB = -20.0  # gate level at sensitivity 0 (only loud sounds get through)
+GATE_QUIETEST_DB = -60.0  # gate level at sensitivity 100, which switches the gate off
+METER_FLOOR_DB = -60.0  # the level meter shows METER_FLOOR_DB (empty) .. 0 dBFS (full)
+GATE_FRAME_SECONDS = 0.05
+GATE_MIN_SPEECH_SECONDS = 0.3  # a chunk needs this much sound above the gate to be transcribed
 
 
 # ----------------------------------------------------------------------------
@@ -95,6 +105,34 @@ def to_model_rate(audio: np.ndarray, sample_rate: int) -> np.ndarray:
         g = math.gcd(MODEL_SAMPLE_RATE, int(sample_rate))
         audio = resample_poly(audio, MODEL_SAMPLE_RATE // g, int(sample_rate) // g).astype(np.float32)
     return audio
+
+
+def gate_db(sensitivity: float) -> float:
+    """Noise-gate level in dBFS for a 0..100 sensitivity: sounds quieter than this are ignored."""
+    return GATE_LOUDEST_DB + (GATE_QUIETEST_DB - GATE_LOUDEST_DB) * sensitivity / 100
+
+
+def db_to_meter(db: float) -> float:
+    """Position on the level meter, 0..1."""
+    return min(1.0, max(0.0, (db - METER_FLOOR_DB) / -METER_FLOOR_DB))
+
+
+def rms_to_meter(rms: float) -> float:
+    return db_to_meter(20 * math.log10(max(rms, 1e-6)))
+
+
+def has_speech(audio: np.ndarray, rate: int, threshold_db: float) -> bool:
+    """True if enough of `audio` is louder than the noise gate to be worth transcribing.
+    Noise-only chunks are skipped, because speech models invent words for background noise."""
+    if threshold_db <= GATE_QUIETEST_DB:  # slider at maximum: gate is off
+        return True
+    frame = int(rate * GATE_FRAME_SECONDS)
+    n = len(audio) // frame
+    if n == 0:
+        return False
+    rms = np.sqrt(np.mean(audio[: n * frame].reshape(n, frame) ** 2, axis=1))
+    loud_frames = np.count_nonzero(rms >= 10 ** (threshold_db / 20))
+    return loud_frames * GATE_FRAME_SECONDS >= GATE_MIN_SPEECH_SECONDS
 
 
 def remove_overlap(previous: str, current: str) -> str:
@@ -404,10 +442,11 @@ class LiveWorker(StoppableThread):
     level = Signal(float)
     failed = Signal(str)
 
-    def __init__(self, recognizer, device_index, parent=None):
+    def __init__(self, recognizer, device_index, sensitivity=DEFAULT_SENSITIVITY, parent=None):
         super().__init__(parent)
         self.recognizer = recognizer
         self.device_index = device_index
+        self.sensitivity = sensitivity  # 0..100; the UI may change it while we run
 
     def run(self):
         try:
@@ -448,7 +487,12 @@ class LiveWorker(StoppableThread):
                     consumed += step
                     parts, have = [buffer[step:]], len(buffer) - step  # keep the overlap for the next chunk
 
-                    text = self.recognizer.transcribe(to_model_rate(buffer[:chunk], rate))
+                    audio = buffer[:chunk]
+                    if not has_speech(audio, rate, gate_db(self.sensitivity)):
+                        previous_text = ""  # a gap: don't de-duplicate against text from before it
+                        continue
+
+                    text = self.recognizer.transcribe(to_model_rate(audio, rate))
                     if not text:
                         continue
                     new_text = remove_overlap(previous_text, text)
@@ -528,7 +572,10 @@ QComboBox {
 QComboBox QAbstractItemView { background: #1d2231; color: #dfe3ee; selection-background-color: #5b6cff; border: 1px solid #2a3047; }
 QProgressBar { background: #1d2231; border: none; border-radius: 4px; height: 8px; text-align: center; color: transparent; }
 QProgressBar::chunk { background: #5b6cff; border-radius: 4px; }
-QProgressBar#level::chunk { background: #3ddc84; }
+QSlider::groove:horizontal { height: 6px; background: #1d2231; border-radius: 3px; }
+QSlider::sub-page:horizontal { background: #5b6cff; border-radius: 3px; }
+QSlider::handle:horizontal { background: #dfe3ee; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px; }
+QSlider::handle:horizontal:hover { background: #ffffff; }
 QTextEdit, QPlainTextEdit {
     background: #0f1117; color: #e6e9f2; border: 1px solid #232838;
     border-radius: 10px; padding: 12px; font-size: 14px;
@@ -542,6 +589,45 @@ QLabel#drop[hover="true"] { border-color: #5b6cff; color: #c9ceff; }
 """
 
 LEVEL_ICON = {"ok": ("✔", "#5fe08f"), "warn": ("⚠", "#f0c05a"), "error": ("✖", "#ff6b7d")}
+
+
+class LevelMeter(QWidget):
+    """Microphone level bar with an orange marker at the noise-gate level.
+    The bar is grey while the sound is below the marker (ignored) and green above it."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(16)
+        self.level = 0.0  # 0..1
+        self.gate = 0.0  # 0..1
+
+    def set_level(self, level: float):
+        # rise instantly, fall smoothly, so the bar is readable instead of flickering
+        self.level = level if level > self.level else self.level * 0.85 + level * 0.15
+        self.update()
+
+    def set_gate(self, gate: float):
+        self.gate = gate
+        self.update()
+
+    def reset(self):
+        self.level = 0.0
+        self.update()
+
+    def paintEvent(self, _event):
+        w, h = self.width(), self.height()
+        bar_h = 8
+        top = (h - bar_h) / 2
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#1d2231"))
+        p.drawRoundedRect(QRectF(0, top, w, bar_h), 4, 4)
+        if self.level > 0.01:
+            p.setBrush(QColor("#3ddc84" if self.level >= self.gate else "#566077"))
+            p.drawRoundedRect(QRectF(0, top, max(float(bar_h), w * self.level), bar_h), 4, 4)
+        p.setBrush(QColor("#ffb86b"))
+        p.drawRoundedRect(QRectF(w * self.gate - 1.5, 0, 3, h), 1.5, 1.5)
 
 
 class DropLabel(QLabel):
@@ -593,6 +679,7 @@ class MainWindow(QMainWindow):
         self.file_worker: FileWorker | None = None
         self.file_path: str | None = None
         self.source_label = ""
+        self.settings = QSettings("SweScribe", "Transcriber")  # remembers the sensitivity between runs
 
         root = QWidget()
         root.setObjectName("root")
@@ -732,15 +819,33 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_start)
         lay.addLayout(row)
 
-        self.level_bar = QProgressBar()
-        self.level_bar.setObjectName("level")
-        self.level_bar.setRange(0, 100)
-        self.level_bar.setTextVisible(False)
-        lay.addWidget(self.level_bar)
+        self.meter = LevelMeter()
+        lay.addWidget(self.meter)
+
+        sens_row = QHBoxLayout()
+        sens_row.addWidget(QLabel("Sensitivity"))
+        self.sensitivity = QSlider(Qt.Horizontal)
+        self.sensitivity.setRange(0, 100)
+        self.sensitivity.setToolTip("Lower it to ignore more background noise, raise it to pick up quieter speech.")
+        try:
+            saved = int(self.settings.value("sensitivity", DEFAULT_SENSITIVITY))
+        except (TypeError, ValueError):
+            saved = DEFAULT_SENSITIVITY
+        self.sensitivity.setValue(max(0, min(100, saved)))
+        self.sensitivity.valueChanged.connect(self.on_sensitivity_changed)
+        sens_row.addWidget(self.sensitivity, stretch=1)
+        self.sens_label = QLabel()
+        self.sens_label.setObjectName("subtitle")
+        self.sens_label.setMinimumWidth(48)
+        self.sens_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        sens_row.addWidget(self.sens_label)
+        lay.addLayout(sens_row)
+        self.on_sensitivity_changed(self.sensitivity.value())  # sync marker and label with the saved value
 
         hint = QLabel(
-            f"Audio is transcribed in {LIVE_CHUNK_SECONDS}-second chunks, "
-            "so text appears a few seconds after you speak."
+            f"Audio is transcribed in {LIVE_CHUNK_SECONDS}-second chunks, so text appears a few seconds after "
+            "you speak. Sound that stays left of the orange marker is ignored: if background noise is being "
+            "transcribed, move the slider left until the noise turns grey."
         )
         hint.setObjectName("subtitle")
         hint.setWordWrap(True)
@@ -968,12 +1073,20 @@ class MainWindow(QMainWindow):
         if device is None:
             QMessageBox.warning(self, "No microphone", "No input device available.")
             return
-        self.live_worker = LiveWorker(self.recognizer, device)
+        self.live_worker = LiveWorker(self.recognizer, device, self.sensitivity.value())
         self.live_worker.level.connect(self.on_level)
         self._launch(self.live_worker, f"Live microphone ({self.device_combo.currentText()})", "● Listening", "live")
 
     def on_level(self, rms: float):
-        self.level_bar.setValue(min(100, int(rms * 400)))
+        self.meter.set_level(rms_to_meter(rms))
+
+    def on_sensitivity_changed(self, value: int):
+        db = gate_db(value)
+        self.meter.set_gate(db_to_meter(db))
+        self.sens_label.setText("Gate off" if db <= GATE_QUIETEST_DB else f"{db:.0f} dB")
+        self.settings.setValue("sensitivity", value)
+        if self.live_worker is not None:
+            self.live_worker.sensitivity = value  # takes effect on the next chunk, even while listening
 
     def browse_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1007,7 +1120,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", msg)
 
     def on_worker_finished(self):
-        self.level_bar.setValue(0)
+        self.meter.reset()
         self.set_status(self.ready_text(), "ready")
         self.update_controls()
 
