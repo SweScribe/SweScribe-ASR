@@ -1,0 +1,8 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# Saved transcripts
+transcript_*.txt
+transcription.txt
