@@ -12,7 +12,6 @@ dependencies = [
     "onnx-asr",
     "onnxruntime",
     "huggingface-hub",
-    "sherpa-onnx",  # Silero VAD + speaker embeddings for "Detect speakers" (CPU only, no torch needed)
 ]
 
 # PyTorch and NeMo are intentionally NOT listed here. They are optional and need a
