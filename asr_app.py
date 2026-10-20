@@ -3,9 +3,11 @@
 Run with:  uv run asr_app.py
 """
 import importlib.util
+import json
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -14,21 +16,24 @@ from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 from pathlib import Path
+from string import Template
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from scipy.signal import resample_poly
 
-from PySide6.QtCore import QRectF, QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtCore import QEasingCurve, QRectF, QSettings, Qt, QThread, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QColorDialog,
     QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -534,65 +539,280 @@ class FileWorker(StoppableThread):
 
 
 # ----------------------------------------------------------------------------
-# Style
+# Theme
 # ----------------------------------------------------------------------------
-STYLE = """
+COLOR_KEYS = ("bg", "surface", "accent", "text")
+COLOR_LABELS = {"bg": "Background", "surface": "Panels", "accent": "Accent", "text": "Text"}
+THEME_MODES = ("dark", "light")
+THEME_DEFAULTS = {
+    "dark": {"bg": "#0f1117", "surface": "#161a24", "accent": "#5b6cff", "text": "#dfe3ee"},
+    "light": {"bg": "#f3f5fa", "surface": "#ffffff", "accent": "#4f5df0", "text": "#1d2233"},
+}
+HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    return tuple(int(color[i : i + 2], 16) for i in (1, 3, 5))
+
+
+def rgb_to_hex(rgb) -> str:
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(c))) for c in rgb)
+
+
+def mix(a: str, b: str, t: float) -> str:
+    """Blend two #rrggbb colors: t=0 gives a, t=1 gives b."""
+    return rgb_to_hex([x + (y - x) * t for x, y in zip(hex_to_rgb(a), hex_to_rgb(b))])
+
+
+def luminance(color: str) -> float:
+    def lin(c):
+        c /= 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (lin(c) for c in hex_to_rgb(color))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def build_palette(base: dict) -> dict:
+    """Derive every UI color from the four the user can edit (background, panels, accent, text)."""
+    bg, surface, accent, text = (base[k] for k in COLOR_KEYS)
+    dark = luminance(bg) < 0.2
+    pal = dict(base)
+    pal.update(
+        muted=mix(text, bg, 0.45),
+        faint=mix(text, bg, 0.65),
+        border=mix(surface, text, 0.12),
+        control=mix(surface, text, 0.07),
+        control_hover=mix(surface, text, 0.13),
+        accent_hover=mix(accent, "#ffffff" if dark else "#000000", 0.15),
+        accent_dim=mix(surface, accent, 0.3),
+        on_accent="#ffffff" if luminance(accent) < 0.4 else "#111111",
+        ok="#3ddc84" if dark else "#1c9a58",
+        warn="#f0c05a" if dark else "#b7791f",
+        err="#ff6b7d" if dark else "#d6293e",
+        gate="#ffb86b" if dark else "#e07a10",
+        danger="#e5484d",
+        danger_hover="#ee6065",
+    )
+    for name in ("ok", "warn", "err"):
+        pal[name + "_bg"] = mix(surface, pal[name], 0.18)
+    return pal
+
+
+def theme_colors(mode: str, custom: dict) -> dict:
+    return {**THEME_DEFAULTS[mode], **custom.get(mode, {})}
+
+
+def load_theme(raw) -> tuple[str, dict]:
+    """Read the saved theme; anything missing or malformed falls back to the defaults."""
+    mode, custom = "dark", {m: {} for m in THEME_MODES}
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        data = {}
+    if isinstance(data, dict):
+        if data.get("mode") in THEME_MODES:
+            mode = data["mode"]
+        saved = data.get("custom")
+        if isinstance(saved, dict):
+            for m in THEME_MODES:
+                colors = saved.get(m)
+                if isinstance(colors, dict):
+                    custom[m] = {
+                        k: v.lower()
+                        for k, v in colors.items()
+                        if k in COLOR_KEYS and isinstance(v, str) and HEX_RE.fullmatch(v)
+                    }
+    return mode, custom
+
+
+def dump_theme(mode: str, custom: dict) -> str:
+    return json.dumps({"mode": mode, "custom": custom})
+
+
+# Colors currently in use; custom-painted widgets read this when they paint.
+THEME_COLORS: dict = build_palette(THEME_DEFAULTS["dark"])
+
+STYLE = Template("""
 * { font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif; font-size: 13px; }
-QMainWindow, QWidget#root { background: #0f1117; }
-QLabel { color: #c9ceda; }
-QLabel#title { font-size: 22px; font-weight: 600; color: #ffffff; }
-QLabel#subtitle { color: #7b8294; }
-QLabel#engineinfo { color: #9aa3b8; font-size: 12px; }
-QLabel#pill { background: #1a1e2a; border-radius: 11px; padding: 4px 12px; color: #9aa3b8; }
-QLabel#pill[state="ready"] { background: #12301f; color: #5fe08f; }
-QLabel#pill[state="busy"] { background: #33290f; color: #f0c05a; }
-QLabel#pill[state="live"] { background: #35171c; color: #ff6b7d; }
-QLabel#pill[state="error"] { background: #35171c; color: #ff6b7d; }
-QFrame#card { background: #161a24; border: 1px solid #232838; border-radius: 14px; }
+QMainWindow, QWidget#root { background: $bg; }
+QToolTip { background: $surface; color: $text; border: 1px solid $border; padding: 4px; }
+QLabel { color: $text; }
+QLabel#title { font-size: 22px; font-weight: 600; }
+QLabel#subtitle { color: $muted; }
+QLabel#engineinfo { color: $muted; font-size: 12px; }
+QLabel#cardtitle { font-size: 15px; font-weight: 600; }
+QLabel#pill { background: $control; border-radius: 11px; padding: 4px 12px; color: $muted; }
+QLabel#pill[state="ready"] { background: $ok_bg; color: $ok; }
+QLabel#pill[state="busy"] { background: $warn_bg; color: $warn; }
+QLabel#pill[state="live"] { background: $err_bg; color: $err; }
+QLabel#pill[state="error"] { background: $err_bg; color: $err; }
+QFrame#card { background: $surface; border: 1px solid $border; border-radius: 14px; }
+QFrame#engine { background: $bg; border: 1px solid $border; border-radius: 12px; }
+QFrame#engine[active="true"] { border: 1px solid $accent; }
 QPushButton {
-    background: #1d2231; color: #dfe3ee; border: 1px solid #2a3047;
+    background: $control; color: $text; border: 1px solid $border;
     border-radius: 9px; padding: 9px 18px;
 }
-QPushButton:hover { background: #252b3f; }
-QPushButton:disabled { color: #566077; background: #171b27; border-color: #1f2434; }
-QPushButton#primary { background: #5b6cff; border: none; color: white; font-weight: 600; }
-QPushButton#primary:hover { background: #7280ff; }
-QPushButton#primary:disabled { background: #2a3050; color: #6b7390; }
-QPushButton#danger { background: #e5484d; border: none; color: white; font-weight: 600; }
-QPushButton#danger:hover { background: #ee6065; }
-QPushButton#tab { background: transparent; border: none; border-radius: 8px; padding: 8px 22px; color: #8a92a8; }
-QPushButton#tab:checked { background: #5b6cff; color: white; font-weight: 600; }
-QPushButton#tab:disabled { color: #4a5268; }
-QPushButton#tab:checked:disabled { background: #2a3050; color: #8a92a8; }
-QFrame#tabbar { background: #161a24; border: 1px solid #232838; border-radius: 12px; }
+QPushButton:hover { background: $control_hover; }
+QPushButton:disabled { color: $faint; }
+QPushButton#primary { background: $accent; border: none; color: $on_accent; font-weight: 600; }
+QPushButton#primary:hover { background: $accent_hover; }
+QPushButton#primary:disabled { background: $accent_dim; color: $faint; }
+QPushButton#danger { background: $danger; border: none; color: white; font-weight: 600; }
+QPushButton#danger:hover { background: $danger_hover; }
+QPushButton#segbtn { background: transparent; border: none; border-radius: 8px; padding: 8px 22px; color: $muted; }
+QPushButton#segbtn:hover { background: transparent; color: $text; }
+QPushButton#segbtn:checked { color: $on_accent; font-weight: 600; }
+QPushButton#segbtn:disabled { color: $faint; }
 QComboBox {
-    background: #1d2231; color: #dfe3ee; border: 1px solid #2a3047;
+    background: $control; color: $text; border: 1px solid $border;
     border-radius: 9px; padding: 8px 12px;
 }
-QComboBox QAbstractItemView { background: #1d2231; color: #dfe3ee; selection-background-color: #5b6cff; border: 1px solid #2a3047; }
-QProgressBar { background: #1d2231; border: none; border-radius: 4px; height: 8px; text-align: center; color: transparent; }
-QProgressBar::chunk { background: #5b6cff; border-radius: 4px; }
-QSlider::groove:horizontal { height: 6px; background: #1d2231; border-radius: 3px; }
-QSlider::sub-page:horizontal { background: #5b6cff; border-radius: 3px; }
-QSlider::handle:horizontal { background: #dfe3ee; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px; }
-QSlider::handle:horizontal:hover { background: #ffffff; }
+QComboBox QAbstractItemView { background: $surface; color: $text; selection-background-color: $accent; selection-color: $on_accent; border: 1px solid $border; }
+QProgressBar { background: $control; border: none; border-radius: 4px; height: 8px; text-align: center; color: transparent; }
+QProgressBar::chunk { background: $accent; border-radius: 4px; }
+QSlider::groove:horizontal { height: 6px; background: $control; border-radius: 3px; }
+QSlider::sub-page:horizontal { background: $accent; border-radius: 3px; }
+QSlider::handle:horizontal { background: $text; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px; }
+QSlider::handle:horizontal:hover { background: $accent_hover; }
 QTextEdit, QPlainTextEdit {
-    background: #0f1117; color: #e6e9f2; border: 1px solid #232838;
+    background: $bg; color: $text; border: 1px solid $border;
     border-radius: 10px; padding: 12px; font-size: 14px;
-    selection-background-color: #5b6cff;
+    selection-background-color: $accent; selection-color: $on_accent;
 }
 QLabel#drop {
-    border: 2px dashed #2f3650; border-radius: 12px; padding: 22px;
-    color: #8a92a8; background: #121622;
+    border: 2px dashed $border; border-radius: 12px; padding: 22px;
+    color: $muted; background: $bg;
 }
-QLabel#drop[hover="true"] { border-color: #5b6cff; color: #c9ceff; }
-"""
+QLabel#drop[hover="true"] { border-color: $accent; color: $text; }
+""")
 
-LEVEL_ICON = {"ok": ("✔", "#5fe08f"), "warn": ("⚠", "#f0c05a"), "error": ("✖", "#ff6b7d")}
+LEVEL_ICON = {"ok": ("✔", "ok"), "warn": ("⚠", "warn"), "error": ("✖", "err")}  # (icon, palette color)
+
+ENGINE_DESCRIPTIONS = {
+    "onnx": (
+        "Lightweight and quick to start. A small quantized (int8) model that runs well on any CPU, with no GPU "
+        "or extra downloads needed. Best for everyday use and live transcription."
+    ),
+    "nemo": (
+        "The full NVIDIA NeMo version of the model. Can be more accurate and is fastest on an NVIDIA GPU, but "
+        "needs PyTorch and NeMo (several GB). Best for long recordings and when accuracy matters most."
+    ),
+}
+
+
+# ----------------------------------------------------------------------------
+# Custom widgets
+# ----------------------------------------------------------------------------
+class SegmentedControl(QWidget):
+    """Pill-shaped toggle whose highlight slides to the selected option."""
+
+    changed = Signal(int)  # emitted when the user clicks an option
+
+    def __init__(self, labels):
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(5, 5, 5, 5)
+        lay.setSpacing(4)
+        self.group = QButtonGroup(self)
+        self.buttons: list[QPushButton] = []
+        for i, text in enumerate(labels):
+            b = QPushButton(text)
+            b.setObjectName("segbtn")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            self.group.addButton(b, i)
+            lay.addWidget(b)
+            self.buttons.append(b)
+        self.buttons[0].setChecked(True)
+        self.index = 0
+        self._from = self._to = QRectF()
+        self._t = 1.0
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(240)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.valueChanged.connect(self._step)
+        self.group.idClicked.connect(self._clicked)
+
+    # -- public API
+    def set_current(self, index: int, animate: bool = True):
+        self.buttons[index].setChecked(True)
+        self.index = index
+        self._move(animate)
+
+    def set_enabled_at(self, index: int, enabled: bool):
+        if self.buttons[index].isEnabled() != enabled:
+            self.buttons[index].setEnabled(enabled)
+            self.update()
+
+    def set_text(self, index: int, text: str):
+        if self.buttons[index].text() != text:
+            self.buttons[index].setText(text)
+            self.layout().activate()
+            self._move(False)
+
+    def set_tooltip(self, index: int, text: str):
+        self.buttons[index].setToolTip(text)
+
+    # -- animation
+    def _clicked(self, index: int):
+        self.index = index
+        self._move(True)
+        self.changed.emit(index)
+
+    def _step(self, value):
+        self._t = float(value)
+        self.update()
+
+    def _shown(self) -> QRectF:
+        a, b, t = self._from, self._to, self._t
+        return QRectF(
+            a.x() + (b.x() - a.x()) * t,
+            a.y() + (b.y() - a.y()) * t,
+            a.width() + (b.width() - a.width()) * t,
+            a.height() + (b.height() - a.height()) * t,
+        )
+
+    def _move(self, animate: bool):
+        target = QRectF(self.buttons[self.index].geometry())
+        self.anim.stop()
+        if animate and self.isVisible() and not self._to.isNull():
+            self._from = self._shown()
+            self._to = target
+            self._t = 0.0
+            self.anim.start()
+        else:
+            self._from = self._to = target
+            self._t = 1.0
+            self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.layout().activate()
+        self._move(False)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._move(False)
+
+    def paintEvent(self, _event):
+        c = THEME_COLORS
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(c["border"]), 1))
+        p.setBrush(QColor(c["surface"]))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
+        if not self._to.isNull():
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(c["accent"] if self.buttons[self.index].isEnabled() else c["accent_dim"]))
+            p.drawRoundedRect(self._shown(), 8, 8)
 
 
 class LevelMeter(QWidget):
-    """Microphone level bar with an orange marker at the noise-gate level.
+    """Microphone level bar with a marker at the noise-gate level.
     The bar is grey while the sound is below the marker (ignored) and green above it."""
 
     def __init__(self):
@@ -615,18 +835,19 @@ class LevelMeter(QWidget):
         self.update()
 
     def paintEvent(self, _event):
+        c = THEME_COLORS
         w, h = self.width(), self.height()
         bar_h = 8
         top = (h - bar_h) / 2
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#1d2231"))
+        p.setBrush(QColor(c["control"]))
         p.drawRoundedRect(QRectF(0, top, w, bar_h), 4, 4)
         if self.level > 0.01:
-            p.setBrush(QColor("#3ddc84" if self.level >= self.gate else "#566077"))
+            p.setBrush(QColor(c["ok"] if self.level >= self.gate else c["faint"]))
             p.drawRoundedRect(QRectF(0, top, max(float(bar_h), w * self.level), bar_h), 4, 4)
-        p.setBrush(QColor("#ffb86b"))
+        p.setBrush(QColor(c["gate"]))
         p.drawRoundedRect(QRectF(w * self.gate - 1.5, 0, 3, h), 1.5, 1.5)
 
 
@@ -658,6 +879,41 @@ class DropLabel(QLabel):
             self.fileDropped.emit(urls[0].toLocalFile())
 
 
+class EngineCard(QFrame):
+    """Name, description and availability of one engine; the active engine gets an accent border."""
+
+    def __init__(self, name: str, description: str, with_action: bool = False):
+        super().__init__()
+        self.setObjectName("engine")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(6)
+        top = QHBoxLayout()
+        title = QLabel(name)
+        title.setObjectName("cardtitle")
+        top.addWidget(title)
+        top.addStretch()
+        self.button: QPushButton | None = None
+        if with_action:
+            self.button = QPushButton("")
+            self.button.setCursor(Qt.PointingHandCursor)
+            self.button.setVisible(False)
+            top.addWidget(self.button)
+        lay.addLayout(top)
+        desc = QLabel(description)
+        desc.setWordWrap(True)
+        lay.addWidget(desc)
+        self.status = QLabel()
+        self.status.setObjectName("engineinfo")
+        self.status.setTextFormat(Qt.RichText)
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+    def set_active(self, active: bool):
+        self.setProperty("active", active)
+        repolish(self)
+
+
 # ----------------------------------------------------------------------------
 # Main window
 # ----------------------------------------------------------------------------
@@ -679,7 +935,10 @@ class MainWindow(QMainWindow):
         self.file_worker: FileWorker | None = None
         self.file_path: str | None = None
         self.source_label = ""
-        self.settings = QSettings("SweScribe", "Transcriber")  # remembers the sensitivity between runs
+        self.settings = QSettings("SweScribe", "Transcriber")  # remembers sensitivity and theme between runs
+        self.theme_mode, self.theme_custom = load_theme(self.settings.value("theme", ""))
+        self.meters: list[LevelMeter] = []
+        self.segs: list[SegmentedControl] = []
 
         root = QWidget()
         root.setObjectName("root")
@@ -705,57 +964,71 @@ class MainWindow(QMainWindow):
         header.addWidget(self.pill, alignment=Qt.AlignTop)
         outer.addLayout(header)
 
-        # Mode toggle (left) + engine toggle (right)
-        toggles = QHBoxLayout()
-        self.mode_group = QButtonGroup(self)
-        mode_bar, (self.btn_live, self.btn_file) = self._make_tab_bar(["🎙  Live", "📁  File"], self.mode_group)
-        self.btn_live.setChecked(True)
-        toggles.addWidget(mode_bar)
-        toggles.addStretch()
-        engine_caption = QLabel("Engine")
-        engine_caption.setObjectName("subtitle")
-        toggles.addWidget(engine_caption)
-        self.engine_group = QButtonGroup(self)
-        engine_bar, engine_btns = self._make_tab_bar([ENGINE_NAMES[k] for k in ENGINE_KEYS], self.engine_group)
-        self.engine_buttons = dict(zip(ENGINE_KEYS, engine_btns))
-        self.engine_buttons[self.engine_key].setChecked(True)
-        toggles.addWidget(engine_bar)
-        outer.addLayout(toggles)
+        # Main navigation: Live / File / Settings
+        self.main_seg = self._segmented(["🎙  Live", "📁  File", "⚙  Settings"])
+        outer.addWidget(self.main_seg, alignment=Qt.AlignLeft)
 
-        # Engine availability details + install button
-        info_row = QHBoxLayout()
-        self.engine_info = QLabel()
-        self.engine_info.setObjectName("engineinfo")
-        self.engine_info.setTextFormat(Qt.RichText)
-        self.engine_info.setWordWrap(True)
-        info_row.addWidget(self.engine_info, stretch=1)
-        self.btn_fix = QPushButton("")
-        self.btn_fix.setCursor(Qt.PointingHandCursor)
-        self.btn_fix.setVisible(False)
-        self.btn_fix.clicked.connect(self.start_install)
-        info_row.addWidget(self.btn_fix, alignment=Qt.AlignTop)
-        outer.addLayout(info_row)
+        self.main_stack = QStackedWidget()
+        self.main_stack.addWidget(self._build_transcribe_page())
+        self.main_stack.addWidget(self._build_settings_page())
+        outer.addWidget(self.main_stack, stretch=1)
+        self.main_seg.changed.connect(self.on_main_tab)
 
-        # Control card with stacked pages
+        self.refresh_devices()
+        self.sensitivity.valueChanged.connect(self.on_sensitivity_changed)
+        self.device_combo.currentIndexChanged.connect(self.update_mic_caption)
+        self.on_sensitivity_changed(self.sensitivity.value())  # sync markers and labels with the saved value
+        self.mode_seg.set_current(THEME_MODES.index(self.theme_mode), animate=False)
+        self.apply_theme()
+        self.update_controls()
+
+        # Check which engines can run (imports can be slow, so do it off the UI thread)
+        self.set_status("Checking engines…", "busy")
+        self.checker = EngineChecker()
+        self.checker.result.connect(self.on_engine_checked)
+        self.checker.start()
+
+    # ---- widget builders --------------------------------------------------
+    def _segmented(self, labels) -> SegmentedControl:
+        seg = SegmentedControl(labels)
+        self.segs.append(seg)
+        return seg
+
+    @staticmethod
+    def _page(spacing: int = 12):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(spacing)
+        return page, lay
+
+    @staticmethod
+    def _card(inner: QWidget) -> QFrame:
         card = QFrame()
         card.setObjectName("card")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(20, 18, 20, 18)
-        self.stack = QStackedWidget()
-        card_layout.addWidget(self.stack)
-        self.stack.addWidget(self._build_live_page())
-        self.stack.addWidget(self._build_file_page())
-        outer.addWidget(card)
-        self.mode_group.idClicked.connect(self.stack.setCurrentIndex)
-        self.engine_group.idClicked.connect(self.on_engine_clicked)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(20, 18, 20, 18)
+        lay.addWidget(inner)
+        return card
 
-        # Transcript
+    @staticmethod
+    def _caption(text: str, width: int = 96) -> QLabel:
+        label = QLabel(text)
+        label.setMinimumWidth(width)
+        return label
+
+    def _build_transcribe_page(self) -> QWidget:
+        page, lay = self._page(14)
+        self.mode_stack = QStackedWidget()
+        self.mode_stack.addWidget(self._build_live_page())
+        self.mode_stack.addWidget(self._build_file_page())
+        lay.addWidget(self._card(self.mode_stack))
+
         self.text = QTextEdit()
         self.text.setReadOnly(True)
         self.text.setPlaceholderText("Transcription will appear here…")
-        outer.addWidget(self.text, stretch=1)
+        lay.addWidget(self.text, stretch=1)
 
-        # Footer
         footer = QHBoxLayout()
         self.count_label = QLabel()
         self.count_label.setObjectName("subtitle")
@@ -767,51 +1040,17 @@ class MainWindow(QMainWindow):
         for b in (self.btn_clear, self.btn_save):
             b.setCursor(Qt.PointingHandCursor)
             footer.addWidget(b)
-        outer.addLayout(footer)
+        lay.addLayout(footer)
         self.btn_clear.clicked.connect(self.clear_transcript)
         self.btn_save.clicked.connect(self.save_transcript)
-
-        self.setStyleSheet(STYLE)
-        self.refresh_devices()
-        self.refresh_engine_info()
-        self.update_controls()
-
-        # Check which engines can run (imports can be slow, so do it off the UI thread)
-        self.set_status("Checking engines…", "busy")
-        self.checker = EngineChecker()
-        self.checker.result.connect(self.on_engine_checked)
-        self.checker.start()
-
-    # ---- widget builders --------------------------------------------------
-    @staticmethod
-    def _make_tab_bar(labels, group):
-        bar = QFrame()
-        bar.setObjectName("tabbar")
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(5, 5, 5, 5)
-        lay.setSpacing(4)
-        buttons = []
-        for i, text in enumerate(labels):
-            b = QPushButton(text)
-            b.setObjectName("tab")
-            b.setCheckable(True)
-            b.setCursor(Qt.PointingHandCursor)
-            group.addButton(b, i)
-            lay.addWidget(b)
-            buttons.append(b)
-        return bar, buttons
+        return page
 
     def _build_live_page(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(12)
-
+        page, lay = self._page()
         row = QHBoxLayout()
-        row.addWidget(QLabel("Microphone"))
-        self.device_combo = QComboBox()
-        self.device_combo.setMinimumWidth(320)
-        row.addWidget(self.device_combo, stretch=1)
+        self.mic_caption = QLabel()
+        self.mic_caption.setWordWrap(True)
+        row.addWidget(self.mic_caption, stretch=1)
         self.btn_start = QPushButton("Start listening")
         self.btn_start.setObjectName("primary")
         self.btn_start.setCursor(Qt.PointingHandCursor)
@@ -819,33 +1058,13 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_start)
         lay.addLayout(row)
 
-        self.meter = LevelMeter()
-        lay.addWidget(self.meter)
-
-        sens_row = QHBoxLayout()
-        sens_row.addWidget(QLabel("Sensitivity"))
-        self.sensitivity = QSlider(Qt.Horizontal)
-        self.sensitivity.setRange(0, 100)
-        self.sensitivity.setToolTip("Lower it to ignore more background noise, raise it to pick up quieter speech.")
-        try:
-            saved = int(self.settings.value("sensitivity", DEFAULT_SENSITIVITY))
-        except (TypeError, ValueError):
-            saved = DEFAULT_SENSITIVITY
-        self.sensitivity.setValue(max(0, min(100, saved)))
-        self.sensitivity.valueChanged.connect(self.on_sensitivity_changed)
-        sens_row.addWidget(self.sensitivity, stretch=1)
-        self.sens_label = QLabel()
-        self.sens_label.setObjectName("subtitle")
-        self.sens_label.setMinimumWidth(48)
-        self.sens_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        sens_row.addWidget(self.sens_label)
-        lay.addLayout(sens_row)
-        self.on_sensitivity_changed(self.sensitivity.value())  # sync marker and label with the saved value
+        meter = LevelMeter()
+        self.meters.append(meter)
+        lay.addWidget(meter)
 
         hint = QLabel(
             f"Audio is transcribed in {LIVE_CHUNK_SECONDS}-second chunks, so text appears a few seconds after "
-            "you speak. Sound that stays left of the orange marker is ignored: if background noise is being "
-            "transcribed, move the slider left until the noise turns grey."
+            "you speak. Choose the microphone and filter out background noise under Settings → Microphone."
         )
         hint.setObjectName("subtitle")
         hint.setWordWrap(True)
@@ -853,11 +1072,7 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_file_page(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(12)
-
+        page, lay = self._page()
         self.drop = DropLabel()
         self.drop.fileDropped.connect(self.set_file)
         lay.addWidget(self.drop)
@@ -882,6 +1097,166 @@ class MainWindow(QMainWindow):
         self.file_progress.setTextVisible(False)
         lay.addWidget(self.file_progress)
         return page
+
+    def _build_settings_page(self) -> QWidget:
+        page, lay = self._page(14)
+        self.sub_seg = self._segmented(["Microphone", "General", "Customization"])
+        lay.addWidget(self.sub_seg, alignment=Qt.AlignLeft)
+        self.sub_stack = QStackedWidget()
+        self.sub_stack.addWidget(self._build_mic_page())
+        self.sub_stack.addWidget(self._build_general_page())
+        self.sub_stack.addWidget(self._build_custom_page())
+        self.sub_seg.changed.connect(self.sub_stack.setCurrentIndex)
+        lay.addWidget(self._card(self.sub_stack))
+        lay.addStretch()
+        return page
+
+    def _build_mic_page(self) -> QWidget:
+        page, lay = self._page()
+        row = QHBoxLayout()
+        row.addWidget(self._caption("Microphone"))
+        self.device_combo = QComboBox()
+        self.device_combo.setMinimumWidth(320)
+        row.addWidget(self.device_combo, stretch=1)
+        lay.addLayout(row)
+
+        sens_row = QHBoxLayout()
+        sens_row.addWidget(self._caption("Sensitivity"))
+        self.sensitivity = QSlider(Qt.Horizontal)
+        self.sensitivity.setRange(0, 100)
+        self.sensitivity.setToolTip("Lower it to ignore more background noise, raise it to pick up quieter speech.")
+        try:
+            saved = int(self.settings.value("sensitivity", DEFAULT_SENSITIVITY))
+        except (TypeError, ValueError):
+            saved = DEFAULT_SENSITIVITY
+        self.sensitivity.setValue(max(0, min(100, saved)))
+        sens_row.addWidget(self.sensitivity, stretch=1)
+        self.sens_label = QLabel()
+        self.sens_label.setObjectName("subtitle")
+        self.sens_label.setMinimumWidth(56)
+        self.sens_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        sens_row.addWidget(self.sens_label)
+        lay.addLayout(sens_row)
+
+        meter = LevelMeter()
+        self.meters.append(meter)
+        lay.addWidget(meter)
+
+        hint = QLabel(
+            "Sound that stays left of the orange marker is ignored. If background noise is being transcribed, "
+            "move the slider left until the noise turns grey. The level shows while you are listening."
+        )
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        return page
+
+    def _build_general_page(self) -> QWidget:
+        page, lay = self._page()
+        row = QHBoxLayout()
+        row.addWidget(self._caption("Engine", 60))
+        self.engine_seg = self._segmented([ENGINE_NAMES[k] for k in ENGINE_KEYS])
+        row.addWidget(self.engine_seg)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self.cards = {
+            key: EngineCard(ENGINE_NAMES[key], ENGINE_DESCRIPTIONS[key], with_action=(key == "nemo"))
+            for key in ENGINE_KEYS
+        }
+        self.btn_fix = self.cards["nemo"].button
+        self.btn_fix.clicked.connect(self.start_install)
+        for card in self.cards.values():
+            lay.addWidget(card)
+        self.engine_seg.set_current(ENGINE_KEYS.index(self.engine_key), animate=False)
+        self.engine_seg.changed.connect(self.on_engine_clicked)
+        return page
+
+    def _build_custom_page(self) -> QWidget:
+        page, lay = self._page(14)
+        row = QHBoxLayout()
+        row.addWidget(self._caption("Theme", 60))
+        self.mode_seg = self._segmented(["🌙  Dark", "☀  Light"])
+        row.addWidget(self.mode_seg)
+        row.addStretch()
+        lay.addLayout(row)
+        self.mode_seg.changed.connect(self.on_theme_mode)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        self.swatches: dict[str, QPushButton] = {}
+        self.hex_labels: dict[str, QLabel] = {}
+        for r, key in enumerate(COLOR_KEYS):
+            swatch = QPushButton("")
+            swatch.setFixedSize(56, 28)
+            swatch.setCursor(Qt.PointingHandCursor)
+            swatch.setToolTip("Click to choose a color")
+            swatch.clicked.connect(lambda _checked=False, k=key: self.pick_color(k))
+            hex_label = QLabel()
+            hex_label.setObjectName("subtitle")
+            self.swatches[key] = swatch
+            self.hex_labels[key] = hex_label
+            grid.addWidget(QLabel(COLOR_LABELS[key]), r, 0)
+            grid.addWidget(swatch, r, 1)
+            grid.addWidget(hex_label, r, 2)
+        grid.setColumnStretch(3, 1)
+        lay.addLayout(grid)
+
+        bottom = QHBoxLayout()
+        self.btn_reset_colors = QPushButton("Reset colors")
+        self.btn_reset_colors.setCursor(Qt.PointingHandCursor)
+        self.btn_reset_colors.clicked.connect(self.reset_colors)
+        bottom.addWidget(self.btn_reset_colors)
+        note = QLabel("Colors are remembered separately for dark and light mode.")
+        note.setObjectName("subtitle")
+        bottom.addWidget(note, stretch=1)
+        lay.addLayout(bottom)
+        return page
+
+    # ---- theme ------------------------------------------------------------
+    def apply_theme(self):
+        colors = theme_colors(self.theme_mode, self.theme_custom)
+        pal = build_palette(colors)
+        THEME_COLORS.clear()
+        THEME_COLORS.update(pal)
+        self.setStyleSheet(STYLE.substitute(pal))
+        for key, swatch in self.swatches.items():
+            swatch.setStyleSheet(f"background: {colors[key]}; border: 1px solid {pal['border']}; border-radius: 8px; padding: 0;")
+            self.hex_labels[key].setText(colors[key].upper())
+        for widget in (*self.segs, *self.meters):
+            widget.update()
+        self.refresh_engine_info()
+        self.render_transcript()
+
+    def save_theme(self):
+        self.settings.setValue("theme", dump_theme(self.theme_mode, self.theme_custom))
+
+    def on_theme_mode(self, idx: int):
+        self.theme_mode = THEME_MODES[idx]
+        self.save_theme()
+        self.apply_theme()
+
+    def pick_color(self, key: str):
+        current = theme_colors(self.theme_mode, self.theme_custom)[key]
+        chosen = QColorDialog.getColor(QColor(current), self, f"Choose {COLOR_LABELS[key].lower()} color")
+        if chosen.isValid():
+            self.theme_custom[self.theme_mode][key] = chosen.name().lower()
+            self.save_theme()
+            self.apply_theme()
+
+    def reset_colors(self):
+        self.theme_custom[self.theme_mode] = {}
+        self.save_theme()
+        self.apply_theme()
+
+    # ---- navigation -------------------------------------------------------
+    def on_main_tab(self, idx: int):
+        if idx == 2:
+            self.main_stack.setCurrentIndex(1)
+        else:
+            self.main_stack.setCurrentIndex(0)
+            self.mode_stack.setCurrentIndex(idx)
 
     # ---- status / state ---------------------------------------------------
     @property
@@ -917,16 +1292,17 @@ class MainWindow(QMainWindow):
         busy = live_on or file_on
         ready = self.recognizer is not None and not self.loading
 
-        self.btn_live.setEnabled(not busy)
-        self.btn_file.setEnabled(not busy)
+        # While one mode runs the other can't be opened; Settings stays reachable
+        self.main_seg.set_enabled_at(0, not file_on)
+        self.main_seg.set_enabled_at(1, not live_on)
 
         # Engine toggle: only engines that passed the check, and not mid-session / mid-load
-        for key, btn in self.engine_buttons.items():
+        for i, key in enumerate(ENGINE_KEYS):
             st = self.statuses.get(key)
-            btn.setEnabled(st is not None and st.level != "error" and not busy and not self.loading)
+            self.engine_seg.set_enabled_at(i, st is not None and st.level != "error" and not busy and not self.loading)
             mark = {"warn": " ⚠", "error": " ✖"}.get(st.level, "") if st else ""
-            btn.setText(ENGINE_NAMES[key] + mark)
-            btn.setToolTip(f"{st.summary} {st.details}".strip() if st else "Checking…")
+            self.engine_seg.set_text(i, ENGINE_NAMES[key] + mark)
+            self.engine_seg.set_tooltip(i, f"{st.summary} {st.details}".strip() if st else "Checking…")
         self.btn_fix.setEnabled(not busy and not self.loading)
 
         self.btn_start.setEnabled(ready and not file_on)
@@ -948,17 +1324,16 @@ class MainWindow(QMainWindow):
 
     # ---- engines ----------------------------------------------------------
     def refresh_engine_info(self):
-        lines = []
         for key in ENGINE_KEYS:
-            name = ENGINE_NAMES[key]
+            card = self.cards[key]
+            card.set_active(key == self.engine_key)
             st = self.statuses.get(key)
             if st is None:
-                lines.append(f'<b>{name}</b> <span style="color:#7b8294">checking…</span>')
+                card.status.setText("Checking…")
                 continue
             icon, color = LEVEL_ICON[st.level]
             extra = f" {escape(st.details)}" if st.level != "ok" and st.details else ""
-            lines.append(f'<b>{name}</b> <span style="color:{color}">{icon}</span> {escape(st.summary)}{extra}')
-        self.engine_info.setText("<br>".join(lines))
+            card.status.setText(f'<span style="color:{THEME_COLORS[color]}">{icon}</span> {escape(st.summary)}{extra}')
 
         nemo = self.statuses.get("nemo")
         self.nemo_fix = nemo.fix if nemo else ""
@@ -994,6 +1369,7 @@ class MainWindow(QMainWindow):
 
     def on_engine_clicked(self, idx: int):
         self.engine_key = ENGINE_KEYS[idx]
+        self.refresh_engine_info()
         self.activate_engine()
 
     def activate_engine(self):
@@ -1033,7 +1409,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(
             self,
             "Model error",
-            f"Could not load the {ENGINE_NAMES[key]} model:\n\n{msg}\n\nClick the engine button again to retry.",
+            f"Could not load the {ENGINE_NAMES[key]} model:\n\n{msg}\n\nSelect the engine again (Settings → General) to retry.",
         )
 
     # ---- devices ----------------------------------------------------------
@@ -1048,6 +1424,9 @@ class MainWindow(QMainWindow):
                         self.device_combo.setCurrentIndex(self.device_combo.count() - 1)
         except Exception as exc:  # noqa: BLE001
             self.device_combo.addItem(f"No input devices ({exc})", None)
+
+    def update_mic_caption(self, *_):
+        self.mic_caption.setText(f"🎙  {self.device_combo.currentText()}  ·  gate: {self.sens_label.text()}")
 
     # ---- running a transcription ------------------------------------------
     def _launch(self, worker, source: str, status: str, state: str):
@@ -1078,12 +1457,16 @@ class MainWindow(QMainWindow):
         self._launch(self.live_worker, f"Live microphone ({self.device_combo.currentText()})", "● Listening", "live")
 
     def on_level(self, rms: float):
-        self.meter.set_level(rms_to_meter(rms))
+        level = rms_to_meter(rms)
+        for meter in self.meters:
+            meter.set_level(level)
 
     def on_sensitivity_changed(self, value: int):
         db = gate_db(value)
-        self.meter.set_gate(db_to_meter(db))
+        for meter in self.meters:
+            meter.set_gate(db_to_meter(db))
         self.sens_label.setText("Gate off" if db <= GATE_QUIETEST_DB else f"{db:.0f} dB")
+        self.update_mic_caption()
         self.settings.setValue("sensitivity", value)
         if self.live_worker is not None:
             self.live_worker.sensitivity = value  # takes effect on the next chunk, even while listening
@@ -1120,14 +1503,25 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", msg)
 
     def on_worker_finished(self):
-        self.meter.reset()
+        for meter in self.meters:
+            meter.reset()
         self.set_status(self.ready_text(), "ready")
         self.update_controls()
 
     # ---- transcript -------------------------------------------------------
+    @staticmethod
+    def segment_html(start: float, text: str) -> str:
+        return f'<span style="color:{THEME_COLORS["accent"]}">[{fmt_time(start)}]</span> {escape(text)}'
+
+    def render_transcript(self):
+        """Redraw the whole transcript (needed when the accent color changes)."""
+        self.text.clear()
+        for s in self.segments:
+            self.text.append(self.segment_html(s.start, s.text))
+
     def add_segment(self, start: float, end: float, text: str):
         self.segments.append(Segment(start, end, text))
-        self.text.append(f'<span style="color:#7c8cff">[{fmt_time(start)}]</span> {escape(text)}')
+        self.text.append(self.segment_html(start, text))
         self.update_footer()
 
     def clear_transcript(self):
